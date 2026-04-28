@@ -535,13 +535,15 @@ function out = oneRun(mdl, randomize)
     out.stabilityBoostMin = min(pre);
     out.stabilityRecoveryMin = min(post);
 
-    out.t = t;
-    out.xyz = x(:,1:3);
-    out.cp = cp;
-    out.cg = cg;
-    out.stability = stability;
-    out.tRecovery = tRecovery;
-    out.iApogee = iA;
+    if ~randomize
+        out.t = t;
+        out.xyz = x(:,1:3);
+        out.cp = cp;
+        out.cg = cg;
+        out.stability = stability;
+        out.tRecovery = tRecovery;
+        out.iApogee = iA;
+    end
 end
 
 function dx = dynamics(t, x, mdl, mDry, mProp0, cdScale, wind, uLaunch)
