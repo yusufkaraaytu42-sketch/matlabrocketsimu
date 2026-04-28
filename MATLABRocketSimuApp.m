@@ -17,8 +17,8 @@ function MATLABRocketSimuApp()
     app.fig = uifigure('Name','MATLAB RocketSimu (ORK + Monte Carlo)', ...
         'Position',[80 80 1400 860]);
 
-    app.grid = uigridlayout(app.fig,[8 6]);
-    app.grid.RowHeight = {36,36,36,'1x','1x','1x',40,40};
+    app.grid = uigridlayout(app.fig,[9 6]);
+    app.grid.RowHeight = {36,36,36,'1x','1x','1x','1x',40,40};
     app.grid.ColumnWidth = {180,180,180,'1x','1x','1x'};
     app.grid.Padding = [10 10 10 10];
 
@@ -88,8 +88,14 @@ function MATLABRocketSimuApp()
     xlabel(app.axHist,'Apogee (m)'); ylabel(app.axHist,'Count');
     grid(app.axHist,'on');
 
+    app.axBend = uiaxes(app.grid);
+    app.axBend.Layout.Row = 7; app.axBend.Layout.Column = [4 6];
+    title(app.axBend,'Material Bending Stress/Strain');
+    xlabel(app.axBend,'Time (s)'); ylabel(app.axBend,'Stress (MPa)');
+    grid(app.axBend,'on');
+
     app.txtLog = uitextarea(app.grid);
-    app.txtLog.Layout.Row = [7 8]; app.txtLog.Layout.Column = [1 6];
+    app.txtLog.Layout.Row = [8 9]; app.txtLog.Layout.Column = [1 6];
     app.txtLog.Value = {'Ready.'};
 
     onLoadDefaults();
@@ -142,10 +148,12 @@ function MATLABRocketSimuApp()
             mu = mean(apogees); sd = std(apogees);
             p05 = prctile(apogees,5); p95 = prctile(apogees,95);
 
-            app.lblApogee.Text = sprintf('Apogee mean=%.2f m | std=%.2f | 5%%=%.2f | 95%%=%.2f | max=%.2f', ...
-                mu, sd, p05, p95, max(apogees));
+            brokeFlags = [rValid.broke];
+            breakPct = 100*mean(brokeFlags);
+            app.lblApogee.Text = sprintf('Apogee mean=%.2f m | std=%.2f | 5%%=%.2f | 95%%=%.2f | max=%.2f | breaks=%.1f%%', ...
+                mu, sd, p05, p95, max(apogees), breakPct);
 
-            cla(app.axTraj); cla(app.axStability); cla(app.axCpCg); cla(app.axHist);
+            cla(app.axTraj); cla(app.axStability); cla(app.axCpCg); cla(app.axHist); cla(app.axBend);
 
             plot3(app.axTraj, sample.xyz(:,1), sample.xyz(:,2), sample.xyz(:,3), 'b-', 'LineWidth',1.5);
             hold(app.axTraj,'on');
@@ -172,7 +180,26 @@ function MATLABRocketSimuApp()
 
             histogram(app.axHist, apogees, min(30,max(10,ceil(sqrt(numel(apogees))))));
 
-            logMsg(sprintf('Done. %d/%d valid runs. Mean apogee %.2f m.',numel(rValid),nIter,mu));
+            yyaxis(app.axBend,'left');
+            hStress = plot(app.axBend, sample.t, sample.bendStress/1e6, 'LineWidth',1.4, 'Color',[0.8 0.1 0.1]);
+            hold(app.axBend,'on');
+            hYield = yline(app.axBend, sample.yieldStress/1e6, '--', 'Yield Limit', 'Color',[0.3 0.3 0.3]);
+            ylabel(app.axBend,'Stress (MPa)');
+            yyaxis(app.axBend,'right');
+            hStrain = plot(app.axBend, sample.t, sample.bendStrain*1e3, 'LineWidth',1.4, 'Color',[0.1 0.5 0.1]);
+            ylabel(app.axBend,'Strain (milli-strain)');
+            hRecovery = xline(app.axBend, sample.tRecovery, '--k', 'Recovery');
+            if sample.broke
+                hBreak = xline(app.axBend, sample.tBreak, ':r', 'Break Point');
+                legend(app.axBend,[hStress hYield hStrain hRecovery hBreak],{'Stress','Yield Limit','Strain','Recovery','Break Point'},'Location','best');
+            else
+                legend(app.axBend,[hStress hYield hStrain hRecovery],{'Stress','Yield Limit','Strain','Recovery'},'Location','best');
+            end
+            hold(app.axBend,'off');
+
+            status = 'NO BREAK';
+            if sample.broke, status = 'BROKE'; end
+            logMsg(sprintf('Done. %d/%d valid runs. Mean apogee %.2f m. Structural status (sample): %s.',numel(rValid),nIter,mu,status));
         catch ME
             uialert(app.fig, ME.message, 'Simulation Error');
             logMsg(['ERROR: ', ME.message]);
@@ -420,6 +447,10 @@ function data = fillMissingWithPrompt(data)
 
     windMu = tryGet(p, {'environment','wind_average'}, 2.0);
     windSigma = tryGet(p, {'environment','wind_turbulence'}, 0.14);
+    youngsModulus = tryGet(p, {'material','youngs_modulus'}, 35e9);
+    yieldStress = tryGet(p, {'material','yield_stress'}, 350e6);
+    outerRadius = tryGet(p, {'material','outer_radius'}, radius);
+    innerRadius = tryGet(p, {'material','inner_radius'}, max(0,0.85*outerRadius));
 
     if isempty(data.thrustTime)
         [f,pth] = uigetfile({'*.csv','CSV files'}, 'Select thrust_source.csv');
@@ -459,13 +490,18 @@ function data = fillMissingWithPrompt(data)
         'cpBase', 0.75*length, ...
         'cpRecovery', 0.85*length, ...
         'cgDry', 0.55*length, ...
-        'cgProp', 0.80*length ...
+        'cgProp', 0.80*length, ...
+        'youngsModulus', youngsModulus, ...
+        'yieldStress', yieldStress, ...
+        'outerRadius', outerRadius, ...
+        'innerRadius', innerRadius ...
     );
 end
 
 function [results, sample] = runMonteCarlo(data, nIter, usePar)
     mdl = data.model;
-    results(1,nIter) = struct('apogee',NaN,'tApogee',NaN,'stabilityBoostMin',NaN,'stabilityRecoveryMin',NaN);
+    results(1,nIter) = struct('apogee',NaN,'tApogee',NaN,'stabilityBoostMin',NaN,'stabilityRecoveryMin',NaN, ...
+        'maxBendStress',NaN,'maxBendStrain',NaN,'broke',false);
 
     if usePar
         parfor k = 1:nIter
@@ -488,6 +524,7 @@ function out = oneRun(mdl, randomize)
         wind = max(0, mdl.windMu + mdl.windSigma*randn());
         inc = mdl.inclination + deg2rad(0.6*randn());
         heading = mdl.heading + deg2rad(2.0*randn());
+        yieldStress = mdl.yieldStress * (1 + 0.08*randn());
     else
         mDry = mdl.mDry;
         mProp = mdl.mProp;
@@ -495,7 +532,9 @@ function out = oneRun(mdl, randomize)
         wind = mdl.windMu;
         inc = mdl.inclination;
         heading = mdl.heading;
+        yieldStress = mdl.yieldStress;
     end
+    yieldStress = max(1e6, yieldStress);
 
     uLaunch = [cos(inc)*cos(heading), cos(inc)*sin(heading), sin(inc)];
     if norm(uLaunch) < 1e-12, uLaunch = [0 0 1]; else, uLaunch = uLaunch/norm(uLaunch); end
@@ -523,6 +562,7 @@ function out = oneRun(mdl, randomize)
     cp(t > tRecovery) = mdl.cpRecovery;
 
     stability = (cp - cg) ./ max(2*mdl.radius, eps);
+    [bendStress, bendStrain, broke, tBreak] = computeStructuralMetrics(t, x, mdl, cdScale, wind, uLaunch, yieldStress);
 
     pre = stability(t<=tRecovery);
     post = stability(t>tRecovery);
@@ -534,6 +574,9 @@ function out = oneRun(mdl, randomize)
     out.tApogee = tApogee;
     out.stabilityBoostMin = min(pre);
     out.stabilityRecoveryMin = min(post);
+    out.maxBendStress = max(bendStress);
+    out.maxBendStrain = max(bendStrain);
+    out.broke = broke;
 
     if ~randomize
         out.t = t;
@@ -543,6 +586,46 @@ function out = oneRun(mdl, randomize)
         out.stability = stability;
         out.tRecovery = tRecovery;
         out.iApogee = iA;
+        out.bendStress = bendStress;
+        out.bendStrain = bendStrain;
+        out.tBreak = tBreak;
+        out.yieldStress = yieldStress;
+    end
+end
+
+function [stress, strain, broke, tBreak] = computeStructuralMetrics(t, x, mdl, cdScale, wind, uLaunch, yieldStress)
+    vel = x(:,4:6);
+    vWind = repmat([wind 0 0], size(vel,1), 1);
+    vRel = vel - vWind;
+    speed = sqrt(sum(vRel.^2,2));
+
+    uLaunchRow = repmat(uLaunch(:)', size(vRel,1), 1);
+    vAlong = sum(vRel .* uLaunchRow, 2);
+    vPerp = vRel - vAlong .* uLaunchRow;
+    alpha = atan2(vecnorm(vPerp,2,2), abs(vAlong)+eps);
+
+    mach = speed / mdl.aSound;
+    cd = interp1(mdl.dragMach, mdl.dragCd, mach, 'linear', 'extrap');
+    cd = max(0.05, cdScale .* cd);
+    q = 0.5 * mdl.rho .* speed.^2;
+
+    sideCoeff = 0.6;
+    lateralArea = 2 * mdl.radius * mdl.length;
+    sideForce = q .* cd .* lateralArea .* sideCoeff .* sin(alpha);
+    bendMoment = sideForce .* (0.5 * mdl.length);
+
+    rO = max(mdl.outerRadius, eps);
+    rI = min(max(mdl.innerRadius,0), 0.99*rO);
+    I = (pi/4) * (rO^4 - rI^4);
+    stress = abs(bendMoment) .* rO ./ max(I,eps);
+
+    E = max(mdl.youngsModulus, 1e6);
+    strain = stress / E;
+    broke = any(stress > yieldStress);
+    if broke
+        tBreak = t(find(stress > yieldStress, 1, 'first'));
+    else
+        tBreak = NaN;
     end
 end
 
