@@ -17,8 +17,8 @@ function MATLABRocketSimuApp()
     app.fig = uifigure('Name','MATLAB RocketSimu (ORK + Monte Carlo)', ...
         'Position',[80 80 1400 860]);
 
-    app.grid = uigridlayout(app.fig,[8 6]);
-    app.grid.RowHeight = {36,36,36,'1x','1x','1x',40,40};
+    app.grid = uigridlayout(app.fig,[9 6]);
+    app.grid.RowHeight = {36,36,36,'1x','1x','1x','1x',40,40};
     app.grid.ColumnWidth = {180,180,180,'1x','1x','1x'};
     app.grid.Padding = [10 10 10 10];
 
@@ -88,8 +88,14 @@ function MATLABRocketSimuApp()
     xlabel(app.axHist,'Apogee (m)'); ylabel(app.axHist,'Count');
     grid(app.axHist,'on');
 
+    app.axStruct = uiaxes(app.grid);
+    app.axStruct.Layout.Row = 7; app.axStruct.Layout.Column = [1 6];
+    title(app.axStruct,'Structural Response: Deflection and Failure Margins');
+    xlabel(app.axStruct,'Time (s)'); ylabel(app.axStruct,'Value');
+    grid(app.axStruct,'on');
+
     app.txtLog = uitextarea(app.grid);
-    app.txtLog.Layout.Row = [7 8]; app.txtLog.Layout.Column = [1 6];
+    app.txtLog.Layout.Row = [8 9]; app.txtLog.Layout.Column = [1 6];
     app.txtLog.Value = {'Ready.'};
 
     onLoadDefaults();
@@ -145,7 +151,7 @@ function MATLABRocketSimuApp()
             app.lblApogee.Text = sprintf('Apogee mean=%.2f m | std=%.2f | 5%%=%.2f | 95%%=%.2f | max=%.2f', ...
                 mu, sd, p05, p95, max(apogees));
 
-            cla(app.axTraj); cla(app.axStability); cla(app.axCpCg); cla(app.axHist);
+            cla(app.axTraj); cla(app.axStability); cla(app.axCpCg); cla(app.axHist); cla(app.axStruct);
 
             plot3(app.axTraj, sample.xyz(:,1), sample.xyz(:,2), sample.xyz(:,3), 'b-', 'LineWidth',1.5);
             hold(app.axTraj,'on');
@@ -172,7 +178,19 @@ function MATLABRocketSimuApp()
 
             histogram(app.axHist, apogees, min(30,max(10,ceil(sqrt(numel(apogees))))));
 
+            plot(app.axStruct, sample.t, sample.deflectionTip, 'Color',[0.2 0.2 0.8], 'LineWidth',1.4);
+            hold(app.axStruct,'on');
+            plot(app.axStruct, sample.t, sample.marginYield, '--', 'Color',[0.85 0.33 0.1], 'LineWidth',1.2);
+            plot(app.axStruct, sample.t, sample.marginBuckling, '-.', 'Color',[0.3 0.6 0.2], 'LineWidth',1.2);
+            yline(app.axStruct, 0, ':k', 'Failure Threshold');
+            hold(app.axStruct,'off');
+            legend(app.axStruct, {'Tip Deflection (m)','Yield Margin','Buckling Margin','Failure Threshold'}, 'Location','best');
+
+            nBreak = sum([rValid.breaks] > 0);
+            nBend = sum([rValid.bends] > 0);
+            bend95 = prctile([rValid.maxDeflection], 95);
             logMsg(sprintf('Done. %d/%d valid runs. Mean apogee %.2f m.',numel(rValid),nIter,mu));
+            logMsg(sprintf('Structural check: breaks=%d, bends=%d, 95%% max deflection=%.4f m.', nBreak, nBend, bend95));
         catch ME
             uialert(app.fig, ME.message, 'Simulation Error');
             logMsg(['ERROR: ', ME.message]);
@@ -323,13 +341,20 @@ function data = fillMissingWithPrompt(data)
         'cpBase', 0.75*length, ...
         'cpRecovery', 0.85*length, ...
         'cgDry', 0.55*length, ...
-        'cgProp', 0.80*length ...
+        'cgProp', 0.80*length, ...
+        'E', tryGet(p, {'structure','youngs_modulus'}, 70e9), ...
+        'wallThickness', tryGet(p, {'structure','wall_thickness'}, 0.0015), ...
+        'yieldStrength', tryGet(p, {'structure','yield_strength'}, 250e6), ...
+        'bucklingFactor', tryGet(p, {'structure','buckling_factor'}, 1.0), ...
+        'bendThreshold', tryGet(p, {'structure','bend_limit_tip_deflection'}, 0.02), ...
+        'normalForceCpFrac', tryGet(p, {'structure','normal_force_cp_fraction'}, 0.7) ...
     );
 end
 
 function [results, sample] = runMonteCarlo(data, nIter, usePar)
     mdl = data.model;
-    results(1,nIter) = struct('apogee',NaN,'tApogee',NaN,'stabilityBoostMin',NaN,'stabilityRecoveryMin',NaN);
+    results(1,nIter) = struct('apogee',NaN,'tApogee',NaN,'stabilityBoostMin',NaN,'stabilityRecoveryMin',NaN, ...
+        'breaks',NaN,'bends',NaN,'maxDeflection',NaN);
 
     if usePar
         parfor k = 1:nIter
@@ -387,6 +412,7 @@ function out = oneRun(mdl, randomize)
     cp(t > tRecovery) = mdl.cpRecovery;
 
     stability = (cp - cg) ./ max(2*mdl.radius, eps);
+    structural = estimateStructuralResponse(t, x, mdl, mDry, mProp, cdScale, wind);
 
     pre = stability(t<=tRecovery);
     post = stability(t>tRecovery);
@@ -398,6 +424,9 @@ function out = oneRun(mdl, randomize)
     out.tApogee = tApogee;
     out.stabilityBoostMin = min(pre);
     out.stabilityRecoveryMin = min(post);
+    out.breaks = any(structural.breakSignal);
+    out.bends = any(structural.bendSignal);
+    out.maxDeflection = max(structural.deflectionTip);
 
     out.t = t;
     out.xyz = x(:,1:3);
@@ -406,6 +435,52 @@ function out = oneRun(mdl, randomize)
     out.stability = stability;
     out.tRecovery = tRecovery;
     out.iApogee = iA;
+    out.deflectionTip = structural.deflectionTip;
+    out.marginYield = structural.marginYield;
+    out.marginBuckling = structural.marginBuckling;
+end
+
+function structural = estimateStructuralResponse(t, x, mdl, mDry, mProp0, cdScale, wind)
+    vel = x(:,4:6);
+    speed = sqrt(sum((vel - [wind 0 0]).^2, 2));
+    mach = speed / mdl.aSound;
+    cd = interp1(mdl.dragMach, mdl.dragCd, mach, 'linear', 'extrap');
+    cd = max(0.05, cdScale*cd);
+    q = 0.5 * mdl.rho .* speed.^2;
+
+    normalForce = q .* cd .* mdl.areaRef;
+    mPropT = max(0, mProp0*(1 - t./max(mdl.burnTime,eps)));
+    massNow = mDry + mPropT;
+    gLoad = vecnorm(x(:,4:6),2,2) ./ max(mdl.g, eps);
+    axialLoad = massNow .* mdl.g .* (1 + gLoad);
+
+    cpLever = max(0.05*mdl.length, mdl.normalForceCpFrac*mdl.length);
+    bendingMoment = normalForce .* cpLever;
+
+    ro = mdl.radius;
+    ri = max(0, ro - mdl.wallThickness);
+    I = (pi/4) * max(eps, ro^4 - ri^4);
+    c = ro;
+    sectionArea = pi * max(eps, ro^2 - ri^2);
+
+    sigmaBending = bendingMoment .* c ./ I;
+    sigmaAxial = axialLoad ./ sectionArea;
+    sigmaVonMises = abs(sigmaAxial) + abs(sigmaBending);
+
+    kBuckling = 2.0;
+    pcr = mdl.bucklingFactor * (pi^2 * mdl.E * I) / max(eps, (kBuckling*mdl.length)^2);
+
+    deflectionTip = normalForce .* mdl.length.^3 ./ max(eps, 3*mdl.E*I);
+
+    marginYield = 1 - sigmaVonMises./max(eps, mdl.yieldStrength);
+    marginBuckling = 1 - axialLoad./max(eps, pcr);
+
+    structural = struct();
+    structural.deflectionTip = deflectionTip;
+    structural.marginYield = marginYield;
+    structural.marginBuckling = marginBuckling;
+    structural.breakSignal = (marginYield < 0) | (marginBuckling < 0);
+    structural.bendSignal = deflectionTip > mdl.bendThreshold;
 end
 
 function dx = dynamics(t, x, mdl, mDry, mProp0, cdScale, wind, uLaunch)
