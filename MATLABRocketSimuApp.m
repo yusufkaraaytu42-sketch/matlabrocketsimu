@@ -228,26 +228,162 @@ function data = loadInputsFromRepo(repoRoot, orkFile)
 end
 
 function ork = parseOrkXml(orkPath)
-    xDoc = xmlread(orkPath);
+    [xmlPath, cleanupFn] = resolveOrkXmlSource(orkPath);
+    c = onCleanup(cleanupFn);
+    xDoc = xmlread(xmlPath);
+
+    lengths = readAllNumerics(xDoc, 'length');
+    radii = readAllNumerics(xDoc, 'radius');
+    masses = readAllNumerics(xDoc, 'mass');
+    cgs = readAllNumerics(xDoc, 'cg');
+
+    deployEvents = readAllText(xDoc, 'deployevent');
+    deployDelays = readAllNumerics(xDoc, 'deploydelay');
+
     ork = struct();
+    ork.lengthBody = pickRepresentative(lengths, @max);
+    ork.radius = pickRepresentative(radii, @max);
+    ork.mass = pickRepresentative(masses, @max);
+    ork.cg = pickRepresentative(cgs, @(v)v(1));
 
-    getTagNumber = @(tag) readFirstNumeric(xDoc, tag);
+    if isnan(ork.radius)
+        diameters = readAllNumerics(xDoc, 'diameter');
+        ork.radius = 0.5 * pickRepresentative(diameters, @max);
+    end
+    ork.referenceDiameter = 2 * ork.radius;
 
-    % OpenRocket XML has multiple <length> tags; we use repository JSON as primary
-    % source and keep XML length as fallback.
-    ork.lengthBody = getTagNumber('length');
-    ork.radius = getTagNumber('radius');
-    ork.mass = getTagNumber('mass');
-    ork.cg = getTagNumber('cg');
-    ork.referenceDiameter = 2*ork.radius;
+    [ork.recoveryEvent, ork.recoveryDelay] = pickRecoveryModel(deployEvents, deployDelays);
+    ork.sourceSummary = struct( ...
+        'lengthCount', numel(lengths), ...
+        'radiusCount', numel(radii), ...
+        'massCount', numel(masses), ...
+        'recoveryEventCount', numel(deployEvents), ...
+        'recoveryDelayCount', numel(deployDelays));
 
-    dep = readFirstText(xDoc,'deployevent');
-    delay = readFirstNumeric(xDoc,'deploydelay');
-    ork.recoveryEvent = dep;
-    ork.recoveryDelay = delay;
+    clear c;
+end
 
-    if isnan(ork.recoveryDelay), ork.recoveryDelay = 1.0; end
-    if isempty(ork.recoveryEvent), ork.recoveryEvent = 'apogee'; end
+function [xmlPath, cleanupFn] = resolveOrkXmlSource(orkPath)
+    cleanupFn = @()[];
+    xmlPath = orkPath;
+
+    try
+        xmlread(xmlPath);
+        return;
+    catch
+    end
+
+    [~,~,ext] = fileparts(orkPath);
+    if ~strcmpi(ext,'.ork')
+        error('Failed to parse XML file: %s', orkPath);
+    end
+
+    tempDir = tempname;
+    mkdir(tempDir);
+    cleanupFn = @()cleanupTempDir(tempDir);
+
+    try
+        unzip(orkPath, tempDir);
+    catch ME
+        error('Unable to read ORK file "%s". OpenRocket .ork files may be compressed zip archives. %s', orkPath, ME.message);
+    end
+
+    candidates = [dir(fullfile(tempDir,'**','*.ork')); dir(fullfile(tempDir,'**','*.xml'))];
+    if isempty(candidates)
+        error('ORK archive "%s" did not contain an XML rocket definition file.', orkPath);
+    end
+
+    [~,idx] = max([candidates.bytes]);
+    xmlPath = fullfile(candidates(idx).folder, candidates(idx).name);
+
+    try
+        xmlread(xmlPath);
+    catch ME
+        error('Extracted XML from "%s" but parsing still failed (%s).', orkPath, ME.message);
+    end
+end
+
+function cleanupTempDir(tempDir)
+    if isfolder(tempDir)
+        rmdir(tempDir,'s');
+    end
+end
+
+function vals = readAllNumerics(xDoc, tagName)
+    vals = [];
+    try
+        elems = xDoc.getElementsByTagName(tagName);
+        n = elems.getLength;
+        vals = nan(1,n);
+        j = 0;
+        for i = 0:n-1
+            txt = strtrim(char(elems.item(i).getTextContent));
+            num = str2double(txt);
+            if ~isnan(num)
+                j = j + 1;
+                vals(j) = num;
+            end
+        end
+        vals = vals(1:j);
+    catch
+        vals = [];
+    end
+end
+
+function txtVals = readAllText(xDoc, tagName)
+    txtVals = strings(0,1);
+    try
+        elems = xDoc.getElementsByTagName(tagName);
+        n = elems.getLength;
+        txtVals = strings(n,1);
+        for i = 0:n-1
+            txtVals(i+1) = strtrim(string(char(elems.item(i).getTextContent)));
+        end
+        txtVals = txtVals(strlength(txtVals) > 0);
+    catch
+        txtVals = strings(0,1);
+    end
+end
+
+function val = pickRepresentative(vals, selectorFn)
+    val = NaN;
+    if isempty(vals)
+        return;
+    end
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        return;
+    end
+    val = selectorFn(vals);
+end
+
+function [eventName, delay] = pickRecoveryModel(events, delays)
+    eventName = 'apogee';
+    delay = 1.0;
+
+    if ~isempty(events)
+        events = lower(strtrim(string(events)));
+        preferIdx = find(events == "apogee", 1, 'first');
+        if isempty(preferIdx)
+            preferIdx = 1;
+        end
+        eventName = char(events(preferIdx));
+
+        if ~isempty(delays)
+            delays = delays(isfinite(delays));
+            if ~isempty(delays)
+                delay = max(0, delays(min(preferIdx, numel(delays))));
+            end
+        end
+        return;
+    end
+
+    if ~isempty(delays)
+        delays = delays(isfinite(delays));
+        if ~isempty(delays)
+            delay = max(0, delays(1));
+        end
+    end
 end
 
 function data = fillMissingWithPrompt(data)
